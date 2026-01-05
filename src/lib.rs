@@ -13,7 +13,34 @@ use solana_program::{
     pubkey::Pubkey,
 };
 
-/// Matcher call instruction layout (67 bytes)
+// =============================================================================
+// Context Account Layout
+// =============================================================================
+// Bytes 0-31:  Stored LP PDA pubkey (set on init, verified on calls)
+// Bytes 32-95: Matcher return data (64 bytes, written on each call)
+// Total minimum: 96 bytes (but percolator expects 320 bytes minimum)
+
+/// Offset where LP PDA is stored in context account
+pub const CTX_LP_PDA_OFFSET: usize = 0;
+/// Length of LP PDA (32 bytes for Pubkey)
+pub const CTX_LP_PDA_LEN: usize = 32;
+/// Offset where matcher return is written
+pub const CTX_RETURN_OFFSET: usize = 32;
+/// Minimum context account size
+pub const CTX_MIN_LEN: usize = CTX_RETURN_OFFSET + MATCHER_RETURN_LEN; // 96 bytes
+
+// =============================================================================
+// Instruction Tags
+// =============================================================================
+
+/// Matcher call instruction tag (from percolator CPI)
+pub const MATCHER_CALL_TAG: u8 = 0;
+/// Initialize instruction tag (stores LP PDA)
+pub const MATCHER_INIT_TAG: u8 = 1;
+
+// =============================================================================
+// Matcher Call Layout (67 bytes) - Tag 0
+// =============================================================================
 /// Offset  Field               Type     Size
 /// 0       tag                 u8       1      Always 0
 /// 1-9     req_id              u64      8
@@ -23,9 +50,11 @@ use solana_program::{
 /// 27-43   req_size            i128     16
 /// 43-67   reserved            [u8;24]  24
 pub const MATCHER_CALL_LEN: usize = 67;
-pub const MATCHER_CALL_TAG: u8 = 0;
 
-/// Matcher return layout (64 bytes) - written to context account
+// =============================================================================
+// Matcher Return Layout (64 bytes)
+// =============================================================================
+
 pub const MATCHER_RETURN_LEN: usize = 64;
 pub const FLAG_VALID: u32 = 1;
 pub const FLAG_PARTIAL_OK: u32 = 2;
@@ -47,19 +76,20 @@ pub struct MatcherReturn {
 }
 
 impl MatcherReturn {
-    /// Write to context account data (first 64 bytes)
+    /// Write to context account data at the return offset
     pub fn write_to(&self, data: &mut [u8]) -> Result<(), ProgramError> {
-        if data.len() < MATCHER_RETURN_LEN {
+        if data.len() < CTX_RETURN_OFFSET + MATCHER_RETURN_LEN {
             return Err(ProgramError::AccountDataTooSmall);
         }
-        data[0..4].copy_from_slice(&self.abi_version.to_le_bytes());
-        data[4..8].copy_from_slice(&self.flags.to_le_bytes());
-        data[8..16].copy_from_slice(&self.exec_price_e6.to_le_bytes());
-        data[16..32].copy_from_slice(&self.exec_size.to_le_bytes());
-        data[32..40].copy_from_slice(&self.req_id.to_le_bytes());
-        data[40..48].copy_from_slice(&self.lp_account_id.to_le_bytes());
-        data[48..56].copy_from_slice(&self.oracle_price_e6.to_le_bytes());
-        data[56..64].copy_from_slice(&self.reserved.to_le_bytes());
+        let buf = &mut data[CTX_RETURN_OFFSET..CTX_RETURN_OFFSET + MATCHER_RETURN_LEN];
+        buf[0..4].copy_from_slice(&self.abi_version.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.exec_price_e6.to_le_bytes());
+        buf[16..32].copy_from_slice(&self.exec_size.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.req_id.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.lp_account_id.to_le_bytes());
+        buf[48..56].copy_from_slice(&self.oracle_price_e6.to_le_bytes());
+        buf[56..64].copy_from_slice(&self.reserved.to_le_bytes());
         Ok(())
     }
 
@@ -151,20 +181,149 @@ impl MatcherCall {
     }
 }
 
-/// Process the matcher CPI call
+// =============================================================================
+// Context Account Helpers
+// =============================================================================
+
+/// Read stored LP PDA from context account
+fn read_lp_pda(data: &[u8]) -> Result<Pubkey, ProgramError> {
+    if data.len() < CTX_LP_PDA_LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    let bytes: [u8; 32] = data[CTX_LP_PDA_OFFSET..CTX_LP_PDA_OFFSET + CTX_LP_PDA_LEN]
+        .try_into()
+        .unwrap();
+    Ok(Pubkey::new_from_array(bytes))
+}
+
+/// Write LP PDA to context account
+fn write_lp_pda(data: &mut [u8], pda: &Pubkey) -> Result<(), ProgramError> {
+    if data.len() < CTX_LP_PDA_LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    data[CTX_LP_PDA_OFFSET..CTX_LP_PDA_OFFSET + CTX_LP_PDA_LEN].copy_from_slice(pda.as_ref());
+    Ok(())
+}
+
+/// Check if context is initialized (LP PDA is non-zero)
+fn is_initialized(data: &[u8]) -> bool {
+    if data.len() < CTX_LP_PDA_LEN {
+        return false;
+    }
+    // Check if any byte in LP PDA slot is non-zero
+    data[CTX_LP_PDA_OFFSET..CTX_LP_PDA_OFFSET + CTX_LP_PDA_LEN]
+        .iter()
+        .any(|&b| b != 0)
+}
+
+// =============================================================================
+// Instruction Processing
+// =============================================================================
+
+/// Process the matcher instruction
 ///
+/// ## Instructions
+///
+/// ### Tag 0: Matcher Call (from percolator CPI)
 /// Accounts:
-/// 0. `[signer]` LP PDA (derived by percolator, passed as signer via invoke_signed)
-/// 1. `[writable]` Matcher context account (owned by this program, result written here)
+/// 0. `[signer]` LP PDA (must match stored PDA)
+/// 1. `[writable]` Matcher context account (owned by this program)
+///
+/// ### Tag 1: Initialize
+/// Accounts:
+/// 0. `[]` LP PDA (will be stored, no signature required)
+/// 1. `[writable]` Matcher context account (owned by this program)
 pub fn process_instruction(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if instruction_data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    match instruction_data[0] {
+        MATCHER_CALL_TAG => process_matcher_call(program_id, accounts, instruction_data),
+        MATCHER_INIT_TAG => process_init(program_id, accounts, instruction_data),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+/// Process Initialize instruction (Tag 1)
+///
+/// Stores the LP PDA in the context account. Does not require PDA signature.
+/// Can only be called once (context must be uninitialized).
+///
+/// Instruction data: [tag: u8] (just the tag byte)
+fn process_init(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    _instruction_data: &[u8],
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let lp_pda = next_account_info(account_iter)?;
+    let ctx_account = next_account_info(account_iter)?;
+
+    // Verify context account is owned by this program
+    if ctx_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // Verify context account is large enough
+    let ctx_data = ctx_account.try_borrow_data()?;
+    if ctx_data.len() < CTX_MIN_LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    // Verify not already initialized
+    if is_initialized(&ctx_data) {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    drop(ctx_data);
+
+    // Store LP PDA
+    let mut ctx_data = ctx_account.try_borrow_mut_data()?;
+    write_lp_pda(&mut ctx_data, lp_pda.key)?;
+
+    Ok(())
+}
+
+/// Process Matcher Call instruction (Tag 0)
+///
+/// Executes passive matching logic and writes result to context account.
+/// Requires LP PDA to be a signer and match the stored PDA.
+fn process_matcher_call(
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let account_iter = &mut accounts.iter();
-    let _lp_pda = next_account_info(account_iter)?; // signer, not used by passive matcher
-    let ctx_account = next_account_info(account_iter)?; // writable, write result here
+    let lp_pda = next_account_info(account_iter)?;
+    let ctx_account = next_account_info(account_iter)?;
 
+    // Verify context account is owned by this program
+    if ctx_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // Verify LP PDA is signer
+    if !lp_pda.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Verify LP PDA matches stored PDA
+    {
+        let ctx_data = ctx_account.try_borrow_data()?;
+        if !is_initialized(&ctx_data) {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        let stored_pda = read_lp_pda(&ctx_data)?;
+        if stored_pda != *lp_pda.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+
+    // Parse instruction
     let call = MatcherCall::parse(instruction_data)?;
 
     // Use default config (50 bps edge)
@@ -200,7 +359,7 @@ pub fn process_instruction(
         _ => MatcherReturn::rejected(call.req_id, call.lp_account_id, call.oracle_price_e6),
     };
 
-    // Write result to context account (first 64 bytes)
+    // Write result to context account
     let mut ctx_data = ctx_account.try_borrow_mut_data()?;
     ret.write_to(&mut ctx_data)?;
 
@@ -211,8 +370,10 @@ pub fn process_instruction(
 mod entrypoint {
     #[allow(unused_imports)]
     use alloc::format; // Required by entrypoint! macro in SBF builds
-    use solana_program::{account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey};
     use crate::process_instruction as processor;
+    use solana_program::{
+        account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
+    };
 
     entrypoint!(process_instruction);
 
