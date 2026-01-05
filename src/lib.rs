@@ -290,7 +290,8 @@ fn process_init(
 /// Process Matcher Call instruction (Tag 0)
 ///
 /// Executes passive matching logic and writes result to context account.
-/// Requires LP PDA to be a signer and match the stored PDA.
+/// If initialized, requires LP PDA to be a signer and match the stored PDA.
+/// If uninitialized (LP PDA is zero), skips signature check.
 fn process_matcher_call(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -305,21 +306,20 @@ fn process_matcher_call(
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // Verify LP PDA is signer
-    if !lp_pda.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    // Verify LP PDA matches stored PDA
+    // Check if initialized and verify signature if so
     {
         let ctx_data = ctx_account.try_borrow_data()?;
-        if !is_initialized(&ctx_data) {
-            return Err(ProgramError::UninitializedAccount);
+        if is_initialized(&ctx_data) {
+            // Initialized: require signature and match
+            if !lp_pda.is_signer {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
+            let stored_pda = read_lp_pda(&ctx_data)?;
+            if stored_pda != *lp_pda.key {
+                return Err(ProgramError::InvalidAccountData);
+            }
         }
-        let stored_pda = read_lp_pda(&ctx_data)?;
-        if stored_pda != *lp_pda.key {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        // Uninitialized: skip signature check (PDA is zero)
     }
 
     // Parse instruction
