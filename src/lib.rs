@@ -16,18 +16,18 @@ use solana_program::{
 // =============================================================================
 // Context Account Layout
 // =============================================================================
-// Bytes 0-31:  Stored LP PDA pubkey (set on init, verified on calls)
-// Bytes 32-95: Matcher return data (64 bytes, written on each call)
-// Total minimum: 96 bytes (but percolator expects 320 bytes minimum)
+// Bytes 0-63:  Matcher return data (64 bytes, written on each call) - ABI required
+// Bytes 64-95: Stored LP PDA pubkey (32 bytes, set on init, verified on calls)
+// Total minimum: 96 bytes (percolator requires 320 bytes minimum)
 
-/// Offset where LP PDA is stored in context account
-pub const CTX_LP_PDA_OFFSET: usize = 0;
+/// Offset where matcher return is written (must be 0 per ABI)
+pub const CTX_RETURN_OFFSET: usize = 0;
+/// Offset where LP PDA is stored (after return data)
+pub const CTX_LP_PDA_OFFSET: usize = MATCHER_RETURN_LEN; // 64
 /// Length of LP PDA (32 bytes for Pubkey)
 pub const CTX_LP_PDA_LEN: usize = 32;
-/// Offset where matcher return is written
-pub const CTX_RETURN_OFFSET: usize = 32;
 /// Minimum context account size
-pub const CTX_MIN_LEN: usize = CTX_RETURN_OFFSET + MATCHER_RETURN_LEN; // 96 bytes
+pub const CTX_MIN_LEN: usize = CTX_LP_PDA_OFFSET + CTX_LP_PDA_LEN; // 96 bytes
 
 // =============================================================================
 // Instruction Tags
@@ -76,20 +76,19 @@ pub struct MatcherReturn {
 }
 
 impl MatcherReturn {
-    /// Write to context account data at the return offset
+    /// Write to context account data at offset 0 (ABI required)
     pub fn write_to(&self, data: &mut [u8]) -> Result<(), ProgramError> {
-        if data.len() < CTX_RETURN_OFFSET + MATCHER_RETURN_LEN {
+        if data.len() < MATCHER_RETURN_LEN {
             return Err(ProgramError::AccountDataTooSmall);
         }
-        let buf = &mut data[CTX_RETURN_OFFSET..CTX_RETURN_OFFSET + MATCHER_RETURN_LEN];
-        buf[0..4].copy_from_slice(&self.abi_version.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.flags.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.exec_price_e6.to_le_bytes());
-        buf[16..32].copy_from_slice(&self.exec_size.to_le_bytes());
-        buf[32..40].copy_from_slice(&self.req_id.to_le_bytes());
-        buf[40..48].copy_from_slice(&self.lp_account_id.to_le_bytes());
-        buf[48..56].copy_from_slice(&self.oracle_price_e6.to_le_bytes());
-        buf[56..64].copy_from_slice(&self.reserved.to_le_bytes());
+        data[0..4].copy_from_slice(&self.abi_version.to_le_bytes());
+        data[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        data[8..16].copy_from_slice(&self.exec_price_e6.to_le_bytes());
+        data[16..32].copy_from_slice(&self.exec_size.to_le_bytes());
+        data[32..40].copy_from_slice(&self.req_id.to_le_bytes());
+        data[40..48].copy_from_slice(&self.lp_account_id.to_le_bytes());
+        data[48..56].copy_from_slice(&self.oracle_price_e6.to_le_bytes());
+        data[56..64].copy_from_slice(&self.reserved.to_le_bytes());
         Ok(())
     }
 

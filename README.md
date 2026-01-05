@@ -52,10 +52,10 @@ The compiled program is output to `target/deploy/percolator_match.so`.
 
 | Offset | Field | Size | Description |
 |--------|-------|------|-------------|
-| 0-31 | lp_pda | 32 | Stored LP PDA (set on init, verified on calls) |
-| 32-95 | return | 64 | Matcher return data (written on each call) |
+| 0-63 | return | 64 | Matcher return data (written on each call) - ABI required |
+| 64-95 | lp_pda | 32 | Stored LP PDA (set on init, verified on calls) |
 
-Minimum size: 96 bytes
+Minimum size: 96 bytes (percolator requires 320 bytes)
 
 ## Instructions
 
@@ -82,7 +82,7 @@ Executes passive matching logic. Requires LP PDA to be a signer and match the st
 | 27-43 | req_size | i128 | Requested size (+buy/-sell) |
 | 43-67 | reserved | [u8;24] | Must be zero |
 
-#### Response (64 bytes at offset 32 in context account)
+#### Response (64 bytes at offset 0 in context account)
 
 | Offset | Field | Type | Description |
 |--------|-------|------|-------------|
