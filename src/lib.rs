@@ -186,7 +186,7 @@ impl MatcherCall {
 
 /// Read stored LP PDA from context account
 fn read_lp_pda(data: &[u8]) -> Result<Pubkey, ProgramError> {
-    if data.len() < CTX_LP_PDA_LEN {
+    if data.len() < CTX_MIN_LEN {
         return Err(ProgramError::AccountDataTooSmall);
     }
     let bytes: [u8; 32] = data[CTX_LP_PDA_OFFSET..CTX_LP_PDA_OFFSET + CTX_LP_PDA_LEN]
@@ -197,7 +197,7 @@ fn read_lp_pda(data: &[u8]) -> Result<Pubkey, ProgramError> {
 
 /// Write LP PDA to context account
 fn write_lp_pda(data: &mut [u8], pda: &Pubkey) -> Result<(), ProgramError> {
-    if data.len() < CTX_LP_PDA_LEN {
+    if data.len() < CTX_MIN_LEN {
         return Err(ProgramError::AccountDataTooSmall);
     }
     data[CTX_LP_PDA_OFFSET..CTX_LP_PDA_OFFSET + CTX_LP_PDA_LEN].copy_from_slice(pda.as_ref());
@@ -206,7 +206,7 @@ fn write_lp_pda(data: &mut [u8], pda: &Pubkey) -> Result<(), ProgramError> {
 
 /// Check if context is initialized (LP PDA is non-zero)
 fn is_initialized(data: &[u8]) -> bool {
-    if data.len() < CTX_LP_PDA_LEN {
+    if data.len() < CTX_MIN_LEN {
         return false;
     }
     // Check if any byte in LP PDA slot is non-zero
