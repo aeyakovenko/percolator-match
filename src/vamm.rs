@@ -49,8 +49,8 @@ impl TryFrom<u8> for MatcherKind {
 // Unified Matcher Context Structure
 // =============================================================================
 
-/// Magic number for initialized context ("PERCMATC" in ASCII, little-endian)
-pub const MATCHER_MAGIC: u64 = 0x4354_414d_4352_4550;
+/// Magic number for initialized context ("CTAMCREP" stored, reads as "PERCMATC")
+pub const MATCHER_MAGIC: u64 = 0x5045_5243_4d41_5443;
 /// Current context version
 pub const MATCHER_VERSION: u32 = 3;
 
