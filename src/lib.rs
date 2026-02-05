@@ -325,7 +325,8 @@ fn process_matcher_call(
         if !lp_pda.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
-        return vamm::process_vamm_call(ctx_account, instruction_data);
+        // Validate LP PDA against stored PDA in vamm context
+        return vamm::process_vamm_call(lp_pda, ctx_account, instruction_data);
     }
 
     // Legacy mode: check if initialized and verify signature if so

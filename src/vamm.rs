@@ -97,8 +97,12 @@ pub struct VammCtx {
     /// Maximum absolute inventory (0 = no limit)
     pub max_inventory_abs: u128,        // 16 bytes
 
+    // ---- LP PDA for signature verification ----
+    /// LP PDA that must sign matcher calls (32 bytes)
+    pub lp_pda: [u8; 32],               // 32 bytes
+
     /// Reserved for future use (fills to 256 bytes)
-    pub _reserved: [u8; 144],           // 144 bytes
+    pub _reserved: [u8; 112],           // 112 bytes (was 144, minus 32 for lp_pda)
 }
 
 // Compile-time size check
@@ -121,7 +125,8 @@ impl Default for VammCtx {
             last_oracle_price_e6: 0,
             last_exec_price_e6: 0,
             max_inventory_abs: 0,
-            _reserved: [0; 144],
+            lp_pda: [0; 32],
+            _reserved: [0; 112],
         }
     }
 }
@@ -160,8 +165,11 @@ impl VammCtx {
         let last_exec_price_e6 = u64::from_le_bytes(data[88..96].try_into().unwrap());
         let max_inventory_abs = u128::from_le_bytes(data[96..112].try_into().unwrap());
 
-        let mut reserved = [0u8; 144];
-        reserved.copy_from_slice(&data[112..256]);
+        let mut lp_pda = [0u8; 32];
+        lp_pda.copy_from_slice(&data[112..144]);
+
+        let mut reserved = [0u8; 112];
+        reserved.copy_from_slice(&data[144..256]);
 
         Ok(Self {
             magic,
@@ -178,6 +186,7 @@ impl VammCtx {
             last_oracle_price_e6,
             last_exec_price_e6,
             max_inventory_abs,
+            lp_pda,
             _reserved: reserved,
         })
     }
@@ -202,7 +211,8 @@ impl VammCtx {
         data[80..88].copy_from_slice(&self.last_oracle_price_e6.to_le_bytes());
         data[88..96].copy_from_slice(&self.last_exec_price_e6.to_le_bytes());
         data[96..112].copy_from_slice(&self.max_inventory_abs.to_le_bytes());
-        data[112..256].copy_from_slice(&self._reserved);
+        data[112..144].copy_from_slice(&self.lp_pda);
+        data[144..256].copy_from_slice(&self._reserved);
 
         Ok(())
     }
@@ -328,7 +338,8 @@ impl InitVammParams {
 /// Can only be called once (context must be uninitialized).
 ///
 /// Accounts:
-/// 0. `[writable]` Matcher context account (owned by this program)
+/// 0. `[]` LP PDA (will be stored for signature verification)
+/// 1. `[writable]` Matcher context account (owned by this program)
 pub fn process_init_vamm(
     program_id: &solana_program::pubkey::Pubkey,
     accounts: &[AccountInfo],
@@ -337,6 +348,7 @@ pub fn process_init_vamm(
     use solana_program::account_info::next_account_info;
 
     let account_iter = &mut accounts.iter();
+    let lp_pda = next_account_info(account_iter)?;
     let ctx_account = next_account_info(account_iter)?;
 
     // Verify ownership
@@ -384,7 +396,8 @@ pub fn process_init_vamm(
         last_oracle_price_e6: 0,
         last_exec_price_e6: 0,
         max_inventory_abs: params.max_inventory_abs,
-        _reserved: [0; 144],
+        lp_pda: lp_pda.key.to_bytes(),
+        _reserved: [0; 112],
     };
 
     ctx.validate()?;
@@ -400,7 +413,10 @@ pub fn process_init_vamm(
 ///
 /// Computes execution price using the configured mode (Passive or vAMM),
 /// updates inventory, and writes result to context.
+///
+/// The lp_pda must be a signer and must match the stored LP PDA.
 pub fn process_vamm_call(
+    lp_pda: &AccountInfo,
     ctx_account: &AccountInfo,
     instruction_data: &[u8],
 ) -> ProgramResult {
@@ -422,6 +438,11 @@ pub fn process_vamm_call(
         VammCtx::read_from(&data[CTX_VAMM_OFFSET..])?
     };
     ctx.validate()?;
+
+    // Validate LP PDA matches stored PDA
+    if lp_pda.key.to_bytes() != ctx.lp_pda {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     // Compute execution based on mode
     let (exec_price, exec_size, flags) = compute_execution(&ctx, &call)?;
@@ -685,7 +706,8 @@ mod tests {
             last_oracle_price_e6: 0,
             last_exec_price_e6: 0,
             max_inventory_abs: 0,       // No limit
-            _reserved: [0; 144],
+            lp_pda: [1; 32],            // Dummy LP PDA for tests
+            _reserved: [0; 112],
         }
     }
 
@@ -705,7 +727,8 @@ mod tests {
             last_oracle_price_e6: 0,
             last_exec_price_e6: 0,
             max_inventory_abs: 0,
-            _reserved: [0; 144],
+            lp_pda: [1; 32],            // Dummy LP PDA for tests
+            _reserved: [0; 112],
         }
     }
 
