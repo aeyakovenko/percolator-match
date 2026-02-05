@@ -19,24 +19,19 @@ use solana_program::{
 // Context Account Layout
 // =============================================================================
 // Bytes 0-63:   Matcher return data (64 bytes, written on each call) - ABI required
-// Bytes 64-319: vAMM context state (256 bytes)
-// Total minimum: 320 bytes (percolator requires 320 bytes minimum)
+// Bytes 64-319: MatcherCtx state (256 bytes)
+// Total: 320 bytes
 
 /// Offset where matcher return is written (must be 0 per ABI)
 pub const CTX_RETURN_OFFSET: usize = 0;
 /// Length of matcher return (64 bytes per ABI)
 pub const MATCHER_RETURN_LEN: usize = 64;
-/// Offset where vAMM context state begins
+/// Offset where matcher context state begins
 pub const CTX_VAMM_OFFSET: usize = MATCHER_RETURN_LEN; // 64
-/// Length of vAMM context state
+/// Length of matcher context state
 pub const CTX_VAMM_LEN: usize = 256;
-/// Minimum context account size (percolator requirement)
+/// Minimum context account size
 pub const MATCHER_CONTEXT_LEN: usize = 320;
-
-// Legacy offsets (for backward compatibility)
-pub const CTX_LP_PDA_OFFSET: usize = MATCHER_RETURN_LEN;
-pub const CTX_LP_PDA_LEN: usize = 32;
-pub const CTX_MIN_LEN: usize = 96;
 
 // =============================================================================
 // Instruction Tags
@@ -44,9 +39,7 @@ pub const CTX_MIN_LEN: usize = 96;
 
 /// Matcher call instruction tag (from percolator CPI)
 pub const MATCHER_CALL_TAG: u8 = 0;
-/// Initialize instruction tag (stores LP PDA) - legacy
-pub const MATCHER_INIT_TAG: u8 = 1;
-/// Initialize vAMM context instruction tag
+/// Initialize context instruction tag
 pub const MATCHER_INIT_VAMM_TAG: u8 = 2;
 
 // =============================================================================
@@ -71,7 +64,7 @@ pub const FLAG_PARTIAL_OK: u32 = 2;
 pub const FLAG_REJECTED: u32 = 4;
 pub const MATCHER_ABI_VERSION: u32 = 1;
 
-/// Matcher return structure written to context account
+/// Matcher return structure written to context account at offset 0
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MatcherReturn {
@@ -106,7 +99,7 @@ impl MatcherReturn {
         Self {
             abi_version: MATCHER_ABI_VERSION,
             flags: FLAG_VALID | FLAG_REJECTED,
-            exec_price_e6: 1, // Non-zero to pass validation
+            exec_price_e6: 1,
             exec_size: 0,
             req_id,
             lp_account_id,
@@ -138,7 +131,7 @@ impl MatcherReturn {
         Self {
             abi_version: MATCHER_ABI_VERSION,
             flags: FLAG_VALID | FLAG_PARTIAL_OK,
-            exec_price_e6: 1, // Non-zero to pass validation
+            exec_price_e6: 1,
             exec_size: 0,
             req_id,
             lp_account_id,
@@ -191,40 +184,6 @@ impl MatcherCall {
 }
 
 // =============================================================================
-// Context Account Helpers (Legacy)
-// =============================================================================
-
-/// Read stored LP PDA from context account (legacy)
-fn read_lp_pda(data: &[u8]) -> Result<Pubkey, ProgramError> {
-    if data.len() < CTX_MIN_LEN {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-    let bytes: [u8; 32] = data[CTX_LP_PDA_OFFSET..CTX_LP_PDA_OFFSET + CTX_LP_PDA_LEN]
-        .try_into()
-        .unwrap();
-    Ok(Pubkey::new_from_array(bytes))
-}
-
-/// Write LP PDA to context account (legacy)
-fn write_lp_pda(data: &mut [u8], pda: &Pubkey) -> Result<(), ProgramError> {
-    if data.len() < CTX_MIN_LEN {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-    data[CTX_LP_PDA_OFFSET..CTX_LP_PDA_OFFSET + CTX_LP_PDA_LEN].copy_from_slice(pda.as_ref());
-    Ok(())
-}
-
-/// Check if context is initialized (LP PDA is non-zero) - legacy check
-fn is_initialized_legacy(data: &[u8]) -> bool {
-    if data.len() < CTX_MIN_LEN {
-        return false;
-    }
-    data[CTX_LP_PDA_OFFSET..CTX_LP_PDA_OFFSET + CTX_LP_PDA_LEN]
-        .iter()
-        .any(|&b| b != 0)
-}
-
-// =============================================================================
 // Instruction Processing
 // =============================================================================
 
@@ -234,17 +193,13 @@ fn is_initialized_legacy(data: &[u8]) -> bool {
 ///
 /// ### Tag 0: Matcher Call (from percolator CPI)
 /// Accounts:
-/// 0. `[signer]` LP PDA (must match stored PDA)
-/// 1. `[writable]` Matcher context account (owned by this program)
+/// 0. `[signer]` LP PDA (must match stored PDA in context)
+/// 1. `[writable]` Matcher context account (must be initialized)
 ///
-/// ### Tag 1: Initialize (Legacy)
+/// ### Tag 2: Initialize Context
 /// Accounts:
-/// 0. `[]` LP PDA (will be stored, no signature required)
+/// 0. `[]` LP PDA (stored for signature verification)
 /// 1. `[writable]` Matcher context account (owned by this program)
-///
-/// ### Tag 2: Initialize vAMM Context
-/// Accounts:
-/// 0. `[writable]` Matcher context account (owned by this program)
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -256,46 +211,15 @@ pub fn process_instruction(
 
     match instruction_data[0] {
         MATCHER_CALL_TAG => process_matcher_call(program_id, accounts, instruction_data),
-        MATCHER_INIT_TAG => process_init_legacy(program_id, accounts, instruction_data),
-        MATCHER_INIT_VAMM_TAG => vamm::process_init_vamm(program_id, accounts, instruction_data),
+        MATCHER_INIT_VAMM_TAG => vamm::process_init(program_id, accounts, instruction_data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
 
-/// Process Initialize instruction (Tag 1) - Legacy
-fn process_init_legacy(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    _instruction_data: &[u8],
-) -> ProgramResult {
-    let account_iter = &mut accounts.iter();
-    let lp_pda = next_account_info(account_iter)?;
-    let ctx_account = next_account_info(account_iter)?;
-
-    if ctx_account.owner != program_id {
-        return Err(ProgramError::IncorrectProgramId);
-    }
-
-    let ctx_data = ctx_account.try_borrow_data()?;
-    if ctx_data.len() < CTX_MIN_LEN {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-
-    if is_initialized_legacy(&ctx_data) {
-        return Err(ProgramError::AccountAlreadyInitialized);
-    }
-    drop(ctx_data);
-
-    let mut ctx_data = ctx_account.try_borrow_mut_data()?;
-    write_lp_pda(&mut ctx_data, lp_pda.key)?;
-
-    Ok(())
-}
-
 /// Process Matcher Call instruction (Tag 0)
 ///
-/// Uses vAMM pricing if context is initialized with vAMM magic,
-/// otherwise falls back to legacy passive matcher behavior.
+/// Context MUST be initialized - uninitalized contexts are rejected.
+/// LP PDA must be a signer and must match the stored PDA.
 fn process_matcher_call(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -310,76 +234,30 @@ fn process_matcher_call(
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // Check if vAMM initialized
-    let is_vamm = {
-        let ctx_data = ctx_account.try_borrow_data()?;
-        if ctx_data.len() >= MATCHER_CONTEXT_LEN {
-            vamm::VammCtx::is_initialized(&ctx_data[CTX_VAMM_OFFSET..])
-        } else {
-            false
-        }
-    };
-
-    if is_vamm {
-        // vAMM mode: require LP PDA signer and use vAMM pricing
-        if !lp_pda.is_signer {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
-        // Validate LP PDA against stored PDA in vamm context
-        return vamm::process_vamm_call(lp_pda, ctx_account, instruction_data);
+    // Verify minimum size
+    if ctx_account.data_len() < MATCHER_CONTEXT_LEN {
+        return Err(ProgramError::AccountDataTooSmall);
     }
 
-    // Legacy mode: check if initialized and verify signature if so
-    {
+    // Check if context is initialized
+    let is_initialized = {
         let ctx_data = ctx_account.try_borrow_data()?;
-        if is_initialized_legacy(&ctx_data) {
-            if !lp_pda.is_signer {
-                return Err(ProgramError::MissingRequiredSignature);
-            }
-            let stored_pda = read_lp_pda(&ctx_data)?;
-            if stored_pda != *lp_pda.key {
-                return Err(ProgramError::InvalidAccountData);
-            }
-        }
-    }
-
-    // Parse instruction
-    let call = MatcherCall::parse(instruction_data)?;
-
-    // Use default config (50 bps edge)
-    let cfg = PassiveMatcherConfig::default();
-    let mut lp_state = PassiveLpState::default();
-
-    let matcher = PassiveOracleBpsMatcher;
-    let result = matcher.execute_match(
-        &cfg,
-        &mut lp_state,
-        call.oracle_price_e6,
-        call.req_size,
-        None,
-    );
-
-    let ret = match result.reason {
-        Reason::Ok => {
-            if result.exec.size == 0 {
-                MatcherReturn::zero_fill(call.req_id, call.lp_account_id, call.oracle_price_e6)
-            } else {
-                MatcherReturn::filled(
-                    result.exec.price,
-                    result.exec.size,
-                    call.req_id,
-                    call.lp_account_id,
-                    call.oracle_price_e6,
-                )
-            }
-        }
-        _ => MatcherReturn::rejected(call.req_id, call.lp_account_id, call.oracle_price_e6),
+        vamm::MatcherCtx::is_initialized(&ctx_data[CTX_VAMM_OFFSET..])
     };
 
-    let mut ctx_data = ctx_account.try_borrow_mut_data()?;
-    ret.write_to(&mut ctx_data)?;
+    // MUST be initialized - reject uninitialized contexts
+    // This prevents state manipulation by untrusted callers
+    if !is_initialized {
+        return Err(ProgramError::UninitializedAccount);
+    }
 
-    Ok(())
+    // Require LP PDA signature
+    if !lp_pda.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Delegate to unified matcher processing (validates PDA match internally)
+    vamm::process_call(lp_pda, ctx_account, instruction_data)
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
