@@ -1,5 +1,9 @@
 # percolator-match
 
+> **⚠️ DISCLAIMER: FOR EDUCATIONAL PURPOSES ONLY**
+>
+> This code has **NOT been audited**. Do NOT use in production or with real funds. This is experimental software provided for learning and testing purposes only. Use at your own risk.
+
 Passive LP matcher for [Percolator](https://github.com/aeyakovenko/percolator-prog).
 
 ## Overview
