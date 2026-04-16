@@ -62,7 +62,7 @@ pub const MATCHER_CALL_LEN: usize = 67;
 pub const FLAG_VALID: u32 = 1;
 pub const FLAG_PARTIAL_OK: u32 = 2;
 pub const FLAG_REJECTED: u32 = 4;
-pub const MATCHER_ABI_VERSION: u32 = 1;
+pub const MATCHER_ABI_VERSION: u32 = 2;
 
 /// Matcher return structure written to context account at offset 0
 #[repr(C)]
