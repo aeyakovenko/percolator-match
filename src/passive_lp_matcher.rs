@@ -93,6 +93,7 @@ pub struct Quote {
 }
 
 /// Ceiling division for u128: ceil(n / d)
+#[allow(clippy::manual_div_ceil)] // const fn: div_ceil() is not const-stable
 #[inline]
 const fn ceil_div_u128(n: u128, d: u128) -> u128 {
     if d == 0 {

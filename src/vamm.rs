@@ -551,11 +551,13 @@ fn compute_passive_execution(
     let oracle = call.oracle_price_e6 as u128;
 
     let exec_price_u128 = if is_buy {
+        // Ceiling division for ask price: round up to protect LP (maker)
         oracle
             .checked_mul(BPS_DENOM + total_bps)
             .ok_or(ProgramError::ArithmeticOverflow)?
-            / BPS_DENOM
+            .div_ceil(BPS_DENOM)
     } else {
+        // Floor division for bid price: round down (standard)
         oracle
             .checked_mul(BPS_DENOM - total_bps)
             .ok_or(ProgramError::ArithmeticOverflow)?
@@ -628,11 +630,13 @@ fn compute_vamm_execution(
     const BPS_DENOM: u128 = 10_000;
 
     let exec_price_u128 = if is_buy {
+        // Ceiling division for ask price: round up to protect LP (maker)
         oracle
             .checked_mul(BPS_DENOM + total_bps)
             .ok_or(ProgramError::ArithmeticOverflow)?
-            / BPS_DENOM
+            .div_ceil(BPS_DENOM)
     } else {
+        // Floor division for bid price: round down (standard)
         oracle
             .checked_mul(BPS_DENOM - total_bps)
             .ok_or(ProgramError::ArithmeticOverflow)?
