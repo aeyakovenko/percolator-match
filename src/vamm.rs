@@ -470,7 +470,8 @@ pub fn process_call(
 
     // Update context state if fill occurred
     if exec_size != 0 {
-        ctx.inventory_base = ctx.inventory_base.saturating_sub(exec_size);
+        ctx.inventory_base = ctx.inventory_base.checked_sub(exec_size)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
         ctx.last_oracle_price_e6 = call.oracle_price_e6;
         ctx.last_exec_price_e6 = exec_price;
     }
@@ -661,7 +662,8 @@ fn check_inventory_limit(ctx: &MatcherCtx, fill_abs: u128, is_buy: bool) -> Resu
         fill_abs as i128
     };
 
-    let new_inv = current_inv.saturating_add(inv_delta);
+    let new_inv = current_inv.checked_add(inv_delta)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
 
     if new_inv.unsigned_abs() <= ctx.max_inventory_abs {
         return Ok(fill_abs);
@@ -953,5 +955,17 @@ mod tests {
         assert_eq!(params.liquidity_notional_e6, decoded.liquidity_notional_e6);
         assert_eq!(params.max_fill_abs, decoded.max_fill_abs);
         assert_eq!(params.max_inventory_abs, decoded.max_inventory_abs);
+    }
+
+    #[test]
+    fn test_inventory_checked_add_overflow() {
+        // check_inventory_limit must return error on i128 overflow,
+        // not silently saturate to i128::MAX via saturating_add.
+        let mut ctx = default_vamm_ctx();
+        ctx.max_inventory_abs = i128::MAX as u128;
+        ctx.inventory_base = i128::MAX;
+        // sell (is_buy=false) → inv_delta = +fill_abs → i128::MAX + 1 overflows
+        let result = check_inventory_limit(&ctx, 1, false);
+        assert!(result.is_err(), "checked_add must error on i128 overflow");
     }
 }
