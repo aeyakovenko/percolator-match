@@ -277,6 +277,11 @@ impl MatcherCtx {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        // max_inventory_abs must fit in i128 for check_inventory_limit cast safety
+        if self.max_inventory_abs > i128::MAX as u128 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         Ok(())
     }
 }
@@ -953,5 +958,19 @@ mod tests {
         assert_eq!(params.liquidity_notional_e6, decoded.liquidity_notional_e6);
         assert_eq!(params.max_fill_abs, decoded.max_fill_abs);
         assert_eq!(params.max_inventory_abs, decoded.max_inventory_abs);
+    }
+
+    #[test]
+    fn test_inventory_limit_rejects_overflow_max() {
+        let mut ctx = default_vamm_ctx();
+        ctx.max_inventory_abs = (i128::MAX as u128) + 1;
+        assert!(ctx.validate().is_err());
+    }
+
+    #[test]
+    fn test_inventory_limit_accepts_max_i128() {
+        let mut ctx = default_vamm_ctx();
+        ctx.max_inventory_abs = i128::MAX as u128;
+        assert!(ctx.validate().is_ok());
     }
 }
