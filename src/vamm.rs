@@ -356,7 +356,7 @@ impl InitParams {
 ///
 /// Accounts:
 /// 0. `[]` LP PDA (stored for signature verification)
-/// 1. `[writable]` Matcher context account (owned by this program)
+/// 1. `[signer, writable]` Matcher context account (owned by this program)
 pub fn process_init(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -367,6 +367,11 @@ pub fn process_init(
     let account_iter = &mut accounts.iter();
     let lp_pda = next_account_info(account_iter)?;
     let ctx_account = next_account_info(account_iter)?;
+
+    // The context signer authorizes binding this account to the supplied LP PDA.
+    if !ctx_account.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     // Verify ownership
     if ctx_account.owner != program_id {
@@ -706,6 +711,58 @@ pub const INIT_VAMM_LEN: usize = INIT_CTX_LEN;
 mod tests {
     use super::*;
 
+    fn default_init_params() -> InitParams {
+        InitParams {
+            kind: MatcherKind::Vamm as u8,
+            trading_fee_bps: 5,
+            base_spread_bps: 10,
+            max_total_bps: 200,
+            impact_k_bps: 100,
+            liquidity_notional_e6: 1_000_000_000_000,
+            max_fill_abs: 1_000_000_000,
+            max_inventory_abs: 500_000,
+        }
+    }
+
+    fn run_init_with_signers(
+        lp_is_signer: bool,
+        ctx_is_signer: bool,
+    ) -> (ProgramResult, alloc::vec::Vec<u8>, Pubkey) {
+        let program_id = Pubkey::new_unique();
+        let lp_pda_key = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let mut ctx_data = alloc::vec![0u8; MATCHER_CONTEXT_LEN];
+        let mut ctx_lamports = 1_000_000_000;
+        let mut lp_lamports = 0;
+        let mut lp_data = alloc::vec::Vec::new();
+
+        let lp_pda_info = AccountInfo::new(
+            &lp_pda_key,
+            lp_is_signer,
+            false,
+            &mut lp_lamports,
+            &mut lp_data,
+            &program_id,
+            false,
+            0,
+        );
+        let ctx_info = AccountInfo::new(
+            &ctx_key,
+            ctx_is_signer,
+            true,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+            false,
+            0,
+        );
+        let accounts = [lp_pda_info, ctx_info];
+
+        let res = process_init(&program_id, &accounts, &default_init_params().encode());
+
+        (res, ctx_data, lp_pda_key)
+    }
+
     fn default_vamm_ctx() -> MatcherCtx {
         MatcherCtx {
             magic: MATCHER_MAGIC,
@@ -756,6 +813,23 @@ mod tests {
             oracle_price_e6: oracle_price,
             req_size,
         }
+    }
+
+    #[test]
+    fn test_process_init_requires_matcher_context_signer() {
+        let (res, ctx_data, _) = run_init_with_signers(true, false);
+
+        assert_eq!(res, Err(ProgramError::MissingRequiredSignature));
+        assert!(!MatcherCtx::is_initialized(&ctx_data[CTX_VAMM_OFFSET..]));
+    }
+
+    #[test]
+    fn test_process_init_allows_unsigned_lp_pda_when_context_signs() {
+        let (res, ctx_data, lp_pda_key) = run_init_with_signers(false, true);
+
+        assert_eq!(res, Ok(()));
+        let ctx = MatcherCtx::read_from(&ctx_data[CTX_VAMM_OFFSET..]).unwrap();
+        assert_eq!(ctx.get_lp_pda(), lp_pda_key);
     }
 
     #[test]
@@ -932,16 +1006,7 @@ mod tests {
 
     #[test]
     fn test_init_params_encode_decode() {
-        let params = InitParams {
-            kind: MatcherKind::Vamm as u8,
-            trading_fee_bps: 5,
-            base_spread_bps: 10,
-            max_total_bps: 200,
-            impact_k_bps: 100,
-            liquidity_notional_e6: 1_000_000_000_000,
-            max_fill_abs: 1_000_000_000,
-            max_inventory_abs: 500_000,
-        };
+        let params = default_init_params();
 
         let encoded = params.encode();
         let decoded = InitParams::parse(&encoded).unwrap();

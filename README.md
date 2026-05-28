@@ -46,8 +46,8 @@ The compiled program is output to `target/deploy/percolator_match.so`.
 ### Setup
 
 1. Deploy the matcher program
-2. Create a context account owned by the matcher program (minimum 96 bytes, recommended 320 bytes)
-3. Initialize the context with the LP PDA (Tag 1 instruction)
+2. Create a 320-byte context account owned by the matcher program
+3. Initialize the context with the matcher context signer and LP PDA (Tag 2 instruction)
 4. Register the LP with Percolator via `InitLP`, setting:
    - `matcher_program`: This program's deployed address
    - `matcher_context`: The initialized context account
@@ -57,9 +57,9 @@ The compiled program is output to `target/deploy/percolator_match.so`.
 | Offset | Field | Size | Description |
 |--------|-------|------|-------------|
 | 0-63 | return | 64 | Matcher return data (written on each call) - ABI required |
-| 64-95 | lp_pda | 32 | Stored LP PDA (set on init, verified on calls) |
+| 64-319 | matcher state | 256 | Matcher configuration and state, including stored LP PDA |
 
-Minimum size: 96 bytes (percolator requires 320 bytes)
+Minimum size: 320 bytes.
 
 ## Instructions
 
@@ -99,26 +99,35 @@ Executes passive matching logic. Requires LP PDA to be a signer and match the st
 | 48-56 | oracle_price_e6 | u64 | Echo of oracle_price_e6 |
 | 56-64 | asset_index | u64 | Echo of asset_index |
 
-### Tag 1: Initialize
+### Tag 2: Initialize
 
-Stores the LP PDA in the context account. Does not require PDA signature (passive init). Can only be called once.
+Stores the LP PDA in the context account. Requires the matcher context account to be a signer. Can only be called once. For keypair-backed contexts, include the context keypair as a transaction signer; PDA-backed contexts must be initialized by a program that can sign for the context PDA with `invoke_signed`.
 
 #### Accounts
 
 | Index | Name | Type | Description |
 |-------|------|------|-------------|
-| 0 | lp_pda | - | LP PDA to store (no signature required) |
-| 1 | matcher_ctx | Writable | Context account owned by this program |
+| 0 | lp_pda | - | LP PDA to store |
+| 1 | matcher_ctx | Signer, Writable | Context account owned by this program |
 
-#### Instruction Data (1 byte)
+#### Instruction Data (66 bytes)
 
 | Offset | Field | Type | Description |
 |--------|-------|------|-------------|
-| 0 | tag | u8 | Always 1 |
+| 0 | tag | u8 | Always 2 |
+| 1 | kind | u8 | 0=Passive, 1=vAMM |
+| 2-6 | trading_fee_bps | u32 | Trading fee in basis points |
+| 6-10 | base_spread_bps | u32 | Base spread in basis points |
+| 10-14 | max_total_bps | u32 | Maximum total spread/fee cap |
+| 14-18 | impact_k_bps | u32 | vAMM impact multiplier, 0 for passive |
+| 18-34 | liquidity_notional_e6 | u128 | vAMM quoting depth, 0 for passive |
+| 34-50 | max_fill_abs | u128 | Maximum absolute fill per call |
+| 50-66 | max_inventory_abs | u128 | Maximum absolute inventory, 0 for no limit |
 
 ## Security
 
-- **LP PDA binding**: The matcher verifies that the LP PDA signer matches the PDA stored during initialization
+- **LP PDA binding**: On matcher calls, the matcher verifies that the LP PDA signer matches the PDA stored during initialization
+- **Authorized init**: Initialization requires the matcher context signer before storing the LP PDA in context
 - **One-time init**: Context can only be initialized once (prevents rebinding)
 - **Program ownership**: Context account must be owned by this program
 
