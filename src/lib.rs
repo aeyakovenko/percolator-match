@@ -41,6 +41,25 @@ pub const MATCHER_CONTEXT_LEN: usize = 320;
 pub const MATCHER_CALL_TAG: u8 = 0;
 /// Initialize context instruction tag
 pub const MATCHER_INIT_VAMM_TAG: u8 = 2;
+/// Batched matcher call instruction tag (atomic multi-leg CPI from percolator).
+pub const MATCHER_BATCH_CALL_TAG: u8 = 3;
+
+// =============================================================================
+// Batched Matcher Call Layout (tag 3) - one LP fills N legs in a single CPI
+// =============================================================================
+/// Offset  Field            Type     Size
+/// 0       tag              u8       1      Always 3
+/// 1       n                u8       1      leg count (1..=MATCHER_BATCH_MAX_LEGS)
+/// 2-10    req_id           u64      8      batch-level request id
+/// 10-18   lp_account_id    u64      8      single LP, echoed on every leg
+/// 18..    legs[n]: { asset_index u16, oracle_price_e6 u64, req_size i128 }  (26 bytes each)
+///
+/// Returns N back-to-back MatcherReturn (64 bytes each) via sol_set_return_data — the per-leg
+/// returns can't be written into the context account (its return slot is only 64 bytes and the
+/// context state follows immediately), and N*64 fits Solana's 1024-byte return-data cap for N<=16.
+pub const MATCHER_BATCH_HEADER_LEN: usize = 18;
+pub const MATCHER_BATCH_LEG_LEN: usize = 26;
+pub const MATCHER_BATCH_MAX_LEGS: usize = 16;
 
 // =============================================================================
 // Matcher Call Layout (67 bytes) - Tag 0
@@ -222,9 +241,42 @@ pub fn process_instruction(
 
     match instruction_data[0] {
         MATCHER_CALL_TAG => process_matcher_call(program_id, accounts, instruction_data),
+        MATCHER_BATCH_CALL_TAG => process_batch_matcher_call(program_id, accounts, instruction_data),
         MATCHER_INIT_VAMM_TAG => vamm::process_init(program_id, accounts, instruction_data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
+}
+
+/// Process Batched Matcher Call instruction (Tag 3)
+///
+/// Same accounts and signer/owner discipline as the single-fill call: the LP PDA must sign once
+/// for the whole batch, and the context must be initialized and owned by this program.
+fn process_batch_matcher_call(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let lp_pda = next_account_info(account_iter)?;
+    let ctx_account = next_account_info(account_iter)?;
+
+    if ctx_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if ctx_account.data_len() < MATCHER_CONTEXT_LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    let is_initialized = {
+        let ctx_data = ctx_account.try_borrow_data()?;
+        vamm::MatcherCtx::is_initialized(&ctx_data[CTX_VAMM_OFFSET..])
+    };
+    if !is_initialized {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if !lp_pda.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    vamm::process_batch_call(lp_pda, ctx_account, instruction_data)
 }
 
 /// Process Matcher Call instruction (Tag 0)

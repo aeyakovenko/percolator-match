@@ -13,7 +13,8 @@ use solana_program::{
 
 use crate::{
     MatcherCall, MatcherReturn, CTX_VAMM_LEN, CTX_VAMM_OFFSET, FLAG_PARTIAL_OK, FLAG_VALID,
-    MATCHER_CONTEXT_LEN,
+    MATCHER_ABI_VERSION, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS,
+    MATCHER_CONTEXT_LEN, MATCHER_RETURN_LEN,
 };
 
 // =============================================================================
@@ -498,6 +499,81 @@ pub fn process_call(
     let mut data = ctx_account.try_borrow_mut_data()?;
     ret.write_to(&mut data)?;
 
+    Ok(())
+}
+
+/// Process a batched matcher call (tag 3): fill N legs against this LP's single inventory in one
+/// CPI. The LP PDA is validated once; each leg runs the same `compute_execution` as the single-fill
+/// path, inventory carries across legs in order, and the N 64-byte returns are emitted via
+/// `set_return_data` (the context account's 64-byte return slot can't hold more than one).
+pub fn process_batch_call(
+    lp_pda: &AccountInfo,
+    ctx_account: &AccountInfo,
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if instruction_data.len() < MATCHER_BATCH_HEADER_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let n = instruction_data[1] as usize;
+    if n == 0
+        || n > MATCHER_BATCH_MAX_LEGS
+        || instruction_data.len() != MATCHER_BATCH_HEADER_LEN + n * MATCHER_BATCH_LEG_LEN
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let req_id = u64::from_le_bytes(instruction_data[2..10].try_into().unwrap());
+    let lp_account_id = u64::from_le_bytes(instruction_data[10..18].try_into().unwrap());
+
+    let mut ctx = {
+        let data = ctx_account.try_borrow_data()?;
+        MatcherCtx::read_from(&data[CTX_VAMM_OFFSET..])?
+    };
+    ctx.validate()?;
+    if lp_pda.key.to_bytes() != ctx.lp_pda {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut returns = [0u8; MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN];
+    for i in 0..n {
+        let base = MATCHER_BATCH_HEADER_LEN + i * MATCHER_BATCH_LEG_LEN;
+        let asset_index = u16::from_le_bytes(instruction_data[base..base + 2].try_into().unwrap());
+        let oracle_price_e6 =
+            u64::from_le_bytes(instruction_data[base + 2..base + 10].try_into().unwrap());
+        let req_size = i128::from_le_bytes(instruction_data[base + 10..base + 26].try_into().unwrap());
+        if oracle_price_e6 == 0 || req_size == i128::MIN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let call = MatcherCall {
+            req_id,
+            asset_index,
+            lp_account_id,
+            oracle_price_e6,
+            req_size,
+        };
+        let (exec_price, exec_size, flags) = compute_execution(&ctx, &call)?;
+        if exec_size != 0 {
+            ctx.inventory_base = ctx.inventory_base.saturating_sub(exec_size);
+            ctx.last_oracle_price_e6 = oracle_price_e6;
+            ctx.last_exec_price_e6 = exec_price;
+        }
+        let ret = MatcherReturn {
+            abi_version: MATCHER_ABI_VERSION,
+            flags,
+            exec_price_e6: exec_price,
+            exec_size,
+            req_id,
+            lp_account_id,
+            oracle_price_e6,
+            asset_index: asset_index as u64,
+        };
+        ret.write_to(&mut returns[i * MATCHER_RETURN_LEN..])?;
+    }
+
+    {
+        let mut data = ctx_account.try_borrow_mut_data()?;
+        ctx.write_to(&mut data[CTX_VAMM_OFFSET..])?;
+    }
+    solana_program::program::set_return_data(&returns[..n * MATCHER_RETURN_LEN]);
     Ok(())
 }
 
