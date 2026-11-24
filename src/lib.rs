@@ -229,7 +229,8 @@ impl MatcherCall {
 /// ### Tag 2: Initialize Context
 /// Accounts:
 /// 0. `[]` LP PDA (stored for signature verification)
-/// 1. `[writable]` Matcher context account (owned by this program)
+/// 1. `[signer, writable]` Matcher context account (owned by this program; signs its own
+///    initialization, so create and initialize it in one transaction)
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],

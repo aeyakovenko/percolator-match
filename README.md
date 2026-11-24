@@ -47,8 +47,10 @@ The compiled program is output to `target/deploy/percolator_match.so`.
 
 1. Deploy the matcher program
 2. Create a context account owned by the matcher program (minimum 96 bytes, recommended 320 bytes)
-3. Initialize the context with the LP PDA (Tag 2 instruction)
-4. Register the LP with Percolator via `InitLP`, setting:
+   and initialize it with the LP PDA (Tag 2 instruction) in the same transaction, signed by the
+   context account's keypair. Initialization requires that signature: a context created in one
+   transaction and initialized in another could otherwise be initialized first by anyone.
+3. Register the LP with Percolator via `InitLP`, setting:
    - `matcher_program`: This program's deployed address
    - `matcher_context`: The initialized context account
 
@@ -134,14 +136,14 @@ Each leg (26 bytes):
 
 ### Tag 2: Initialize
 
-Stores the LP PDA in the context account. Does not require PDA signature (passive init). Can only be called once.
+Stores the LP PDA in the context account. The context account must sign; the LP PDA does not (passive init: it is a Percolator-derived delegate that signs only inside Percolator's CPI). Can only be called once.
 
 #### Accounts
 
 | Index | Name | Type | Description |
 |-------|------|------|-------------|
 | 0 | lp_pda | - | LP PDA to store (no signature required) |
-| 1 | matcher_ctx | Writable | Context account owned by this program |
+| 1 | matcher_ctx | Signer, Writable | Context account owned by this program |
 
 #### Instruction Data (1 byte)
 
@@ -153,6 +155,8 @@ Stores the LP PDA in the context account. Does not require PDA signature (passiv
 
 - **LP PDA binding**: The matcher verifies that the LP PDA signer matches the PDA stored during initialization
 - **One-time init**: Context can only be initialized once (prevents rebinding)
+- **Init authorization**: The context account signs its own initialization, so nobody else can initialize it first
+- **Inventory bounds**: `max_inventory_abs` must fit in `i128`, and inventory updates fail instead of clamping on overflow
 - **Program ownership**: Context account must be owned by this program
 
 ## License

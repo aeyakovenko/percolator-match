@@ -275,6 +275,12 @@ impl MatcherCtx {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        // The inventory limit is compared with the signed inventory, so it must fit in i128
+        // (a larger value would wrap negative and invert the limit).
+        if self.max_inventory_abs > i128::MAX as u128 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         Ok(())
     }
 }
@@ -357,7 +363,8 @@ impl InitParams {
 ///
 /// Accounts:
 /// 0. `[]` LP PDA (stored for signature verification)
-/// 1. `[writable]` Matcher context account (owned by this program)
+/// 1. `[signer, writable]` Matcher context account (owned by this program; it signs its own
+///    initialization)
 pub fn process_init(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -368,6 +375,15 @@ pub fn process_init(
     let account_iter = &mut accounts.iter();
     let lp_pda = next_account_info(account_iter)?;
     let ctx_account = next_account_info(account_iter)?;
+
+    // The context account signs its own initialization. An account becomes owned by this program
+    // when it is created, so without this check anyone could initialize an LP's freshly created
+    // context first and bind it to their own parameters (or burn it). Creating and initializing in
+    // one transaction, with the context keypair signing both, is the expected setup. The LP PDA does
+    // not sign here: it is a Percolator-derived delegate that signs only inside Percolator's CPI.
+    if !ctx_account.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     // Verify ownership
     if ctx_account.owner != program_id {
@@ -468,7 +484,7 @@ pub fn process_call(
 
     // Update context state if fill occurred
     if exec_size != 0 {
-        ctx.inventory_base = ctx.inventory_base.saturating_sub(exec_size);
+        ctx.inventory_base = inventory_after_fill(ctx.inventory_base, exec_size)?;
         ctx.last_oracle_price_e6 = call.oracle_price_e6;
         ctx.last_exec_price_e6 = exec_price;
     }
@@ -547,7 +563,7 @@ pub fn process_batch_call(
         };
         let (exec_price, exec_size, flags) = compute_execution(&ctx, &call)?;
         if exec_size != 0 {
-            ctx.inventory_base = ctx.inventory_base.saturating_sub(exec_size);
+            ctx.inventory_base = inventory_after_fill(ctx.inventory_base, exec_size)?;
             ctx.last_oracle_price_e6 = oracle_price_e6;
             ctx.last_exec_price_e6 = exec_price;
         }
@@ -719,7 +735,19 @@ fn compute_vamm_execution(
     Ok((exec_price_u128 as u64, exec_size, FLAG_VALID))
 }
 
-/// Check and enforce inventory limit
+/// The LP's inventory after a fill of `exec_size` (the taker's signed size; the LP takes the other
+/// side). Fails instead of clamping when the result does not fit.
+fn inventory_after_fill(inventory_base: i128, exec_size: i128) -> Result<i128, ProgramError> {
+    inventory_base
+        .checked_sub(exec_size)
+        .ok_or(ProgramError::ArithmeticOverflow)
+}
+
+/// Check and enforce inventory limit: the fill is capped at the room left before the LP's
+/// inventory reaches the limit in the fill's direction (a taker buy lowers the LP's inventory
+/// toward `-max_inventory_abs`, a taker sell raises it toward `+max_inventory_abs`). The room is
+/// computed in `u128`, where it cannot overflow: the limit fits `i128` (`validate`), so the room is
+/// at most `2 * i128::MAX + 1`.
 fn check_inventory_limit(
     ctx: &MatcherCtx,
     fill_abs: u128,
@@ -728,35 +756,30 @@ fn check_inventory_limit(
     if ctx.max_inventory_abs == 0 {
         return Ok(fill_abs);
     }
-
-    let current_inv = ctx.inventory_base;
-    let max_inv = ctx.max_inventory_abs as i128;
-
-    let inv_delta = if is_buy {
-        -(fill_abs as i128)
+    let max = ctx.max_inventory_abs;
+    if max > i128::MAX as u128 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let current = ctx.inventory_base;
+    let room = if is_buy {
+        // from `current` down to `-max`
+        if current >= 0 {
+            (current as u128)
+                .checked_add(max)
+                .ok_or(ProgramError::ArithmeticOverflow)?
+        } else {
+            max.saturating_sub(current.unsigned_abs())
+        }
     } else {
-        fill_abs as i128
+        // from `current` up to `max`
+        if current >= 0 {
+            max.saturating_sub(current as u128)
+        } else {
+            max.checked_add(current.unsigned_abs())
+                .ok_or(ProgramError::ArithmeticOverflow)?
+        }
     };
-
-    let new_inv = current_inv.saturating_add(inv_delta);
-
-    if new_inv.unsigned_abs() <= ctx.max_inventory_abs {
-        return Ok(fill_abs);
-    }
-
-    if is_buy {
-        if current_inv <= -max_inv {
-            return Ok(0);
-        }
-        let max_fill = (current_inv + max_inv).unsigned_abs();
-        Ok(core::cmp::min(fill_abs, max_fill))
-    } else {
-        if current_inv >= max_inv {
-            return Ok(0);
-        }
-        let max_fill = (max_inv - current_inv).unsigned_abs();
-        Ok(core::cmp::min(fill_abs, max_fill))
-    }
+    Ok(core::cmp::min(fill_abs, room))
 }
 
 // =============================================================================
@@ -1030,5 +1053,110 @@ mod tests {
         assert_eq!(params.liquidity_notional_e6, decoded.liquidity_notional_e6);
         assert_eq!(params.max_fill_abs, decoded.max_fill_abs);
         assert_eq!(params.max_inventory_abs, decoded.max_inventory_abs);
+    }
+
+    fn passive_init_params() -> InitParams {
+        InitParams {
+            kind: MatcherKind::Passive as u8,
+            trading_fee_bps: 5,
+            base_spread_bps: 50,
+            max_total_bps: 200,
+            impact_k_bps: 0,
+            liquidity_notional_e6: 0,
+            max_fill_abs: 1_000_000_000,
+            max_inventory_abs: 0,
+        }
+    }
+
+    /// Runs `process_init` with a fresh, program-owned context account; `ctx_signs` says whether the
+    /// context account signs. Returns the result and the context's bytes afterwards.
+    fn run_init(ctx_signs: bool) -> (ProgramResult, [u8; MATCHER_CONTEXT_LEN]) {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let system = Pubkey::default();
+        let (mut lp_lamports, mut ctx_lamports) = (0u64, 1_000_000u64);
+        let mut lp_data: [u8; 0] = [];
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+        let lp = AccountInfo::new(
+            &lp_key,
+            false,
+            false,
+            &mut lp_lamports,
+            &mut lp_data,
+            &system,
+            false,
+            0,
+        );
+        let ctx = AccountInfo::new(
+            &ctx_key,
+            ctx_signs,
+            true,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+            false,
+            0,
+        );
+        let result = process_init(
+            &program_id,
+            &[lp, ctx.clone()],
+            &passive_init_params().encode(),
+        );
+        let mut bytes = [0u8; MATCHER_CONTEXT_LEN];
+        bytes.copy_from_slice(&ctx.try_borrow_data().unwrap()[..MATCHER_CONTEXT_LEN]);
+        (result, bytes)
+    }
+
+    #[test]
+    fn test_init_requires_the_context_account_to_sign() {
+        let (unsigned, untouched) = run_init(false);
+        assert_eq!(unsigned, Err(ProgramError::MissingRequiredSignature));
+        assert!(
+            untouched.iter().all(|byte| *byte == 0),
+            "a refused init writes nothing"
+        );
+
+        let (signed, initialized) = run_init(true);
+        assert_eq!(signed, Ok(()));
+        let ctx = MatcherCtx::read_from(&initialized[CTX_VAMM_OFFSET..]).unwrap();
+        assert!(MatcherCtx::is_initialized(&initialized[CTX_VAMM_OFFSET..]));
+        assert_eq!(ctx.kind, MatcherKind::Passive as u8);
+    }
+
+    #[test]
+    fn test_validation_rejects_an_inventory_limit_that_does_not_fit_i128() {
+        let mut ctx = default_passive_ctx();
+        ctx.max_inventory_abs = i128::MAX as u128;
+        assert!(ctx.validate().is_ok());
+        ctx.max_inventory_abs = i128::MAX as u128 + 1;
+        assert_eq!(ctx.validate(), Err(ProgramError::InvalidAccountData));
+        ctx.max_inventory_abs = u128::MAX;
+        assert_eq!(ctx.validate(), Err(ProgramError::InvalidAccountData));
+    }
+
+    #[test]
+    fn test_inventory_limit_at_the_largest_limit_caps_fills_both_ways() {
+        let mut ctx = default_passive_ctx();
+        ctx.max_inventory_abs = i128::MAX as u128;
+        ctx.inventory_base = i128::MAX - 10;
+        // The LP sells to a buyer (its inventory falls): no limit binds.
+        assert_eq!(check_inventory_limit(&ctx, 1_000, true), Ok(1_000));
+        // The LP buys from a seller (its inventory rises): only 10 more fit.
+        assert_eq!(check_inventory_limit(&ctx, 1_000, false), Ok(10));
+    }
+
+    #[test]
+    fn test_inventory_update_fails_instead_of_clamping() {
+        assert_eq!(inventory_after_fill(5, 3), Ok(2));
+        assert_eq!(inventory_after_fill(i128::MIN + 1, 1), Ok(i128::MIN));
+        assert_eq!(
+            inventory_after_fill(i128::MIN, 1),
+            Err(ProgramError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            inventory_after_fill(i128::MAX, -1),
+            Err(ProgramError::ArithmeticOverflow)
+        );
     }
 }
